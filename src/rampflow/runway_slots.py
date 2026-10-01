@@ -66,14 +66,22 @@ class RunwaySlotManager:
         return datetime.fromtimestamp(rounded,tz=t.tzinfo)
 
     def _sep(self, leader: str, follower: str) -> int:
-        pair = tuple(sorted((leader, follower)))
-        direct = self.wake.get(pair)
+        # Wake separation is directional: the pair key is (leader, follower).
+        # It must never be key-sorted, which swaps leader and follower and can
+        # hand back an under-sized gap (e.g. light leader / heavy follower).
+        direct = self.wake.get((leader, follower))
         if direct is not None:
             return int(direct)
+        follower_default = self.wake.get(("*", follower))
+        if follower_default is not None:
+            return int(follower_default)
         reverse = self.wake.get((follower, leader))
         if reverse is not None:
+            # Last-resort backstop for incomplete tables: using the reverse
+            # pairing is non-standard, so callers should supply follower
+            # defaults ("*", follower) rather than rely on this.
             return int(reverse)
-        return int(self.wake.get(("*", follower), 60))
+        return int(self.wake.get(("*", leader), 60))
 
     def _ctot_ok(self,req:SlotRequest,slot:datetime)->bool:
         if req.ctot is None:return True
@@ -99,6 +107,25 @@ class RunwaySlotManager:
 
     def _wind_ok(self,runway:Runway,tailwind_kt:float,crosswind_kt:float)->bool:
         return tailwind_kt<=runway.max_tailwind_kt and crosswind_kt<=runway.max_crosswind_kt
+
+    def conflict_for(self,runway_id:str,operation:str,wake_category:str,slot:datetime,occupancy_seconds:int|None=None,ignore_flight:str|None=None)->RunwayUse|None:
+        """Read-only conflict probe against committed traffic, optionally
+        ignoring one flight (used when a plan re-books its own release)."""
+        runway=self.runways[runway_id]
+        occ=occupancy_seconds if occupancy_seconds is not None else runway.occupancy_seconds
+        probe=Window(slot,slot+timedelta(seconds=occ))
+        for use in self._uses[runway_id]:
+            if ignore_flight is not None and use.flight_id==ignore_flight:continue
+            if use.occupied.overlaps(probe):
+                return use
+            if use.slot<=slot:
+                if slot<use.slot+timedelta(seconds=self._sep(use.wake_category,wake_category)):return use
+            else:
+                if use.slot<slot+timedelta(seconds=self._sep(wake_category,use.wake_category)):return use
+            if not runway.mixed_mode and use.operation!=operation:
+                if abs((use.slot-slot).total_seconds())<max(90,runway.occupancy_seconds):
+                    return use
+        return None
 
     def find(self,req:SlotRequest,wind_by_runway:Mapping[str,tuple[float,float]]|None=None)->RunwayUse:
         wind=wind_by_runway or {}
@@ -159,3 +186,14 @@ class RunwaySlotManager:
             if any(o.occupied.overlaps(item.occupied) for o in other):raise RuntimeError("resequence collides with fixed traffic")
         self._uses[runway_id]=sorted(other+updated,key=lambda x:(x.slot,x.sequence))
         return tuple(updated)
+
+    def release(self,flight_id:str)->bool:
+        """Give back a committed time slot so the runway can serve other
+        traffic. Expired or cancelled plans must not keep holding slots."""
+        removed=False
+        for rid in list(self._uses):
+            kept=[u for u in self._uses[rid] if u.flight_id!=flight_id]
+            if len(kept)!=len(self._uses[rid]):
+                removed=True
+                self._uses[rid]=kept
+        return removed
