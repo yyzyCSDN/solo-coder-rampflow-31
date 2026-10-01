@@ -25,6 +25,7 @@ class SlotAllocation:
     request_target:datetime
     generation:int
     priority:int
+    wake_class:str="M"
 
 @dataclass(frozen=True)
 class CapacityBand:
@@ -59,9 +60,9 @@ class SlotCoordinator:
         for fid,a in self._allocations.items():
             if fid==ignore_flight or a.runway!=runway:continue
             if a.time<=t:
-                sep=self._separation(getattr(a,'wake_class','M') if hasattr(a,'wake_class') else 'M',wake)
+                sep=self._separation(a.wake_class,wake)
             else:
-                sep=self._separation(wake,getattr(a,'wake_class','M') if hasattr(a,'wake_class') else 'M')
+                sep=self._separation(wake,a.wake_class)
             if abs((a.time-t).total_seconds())<sep:return False
         return True
 
@@ -80,15 +81,17 @@ class SlotCoordinator:
                 t+=timedelta(seconds=30)
         if not candidates:raise RuntimeError("no feasible runway slot")
         _,t,runway=min(candidates,key=lambda x:(x[0],x[1],x[2]))
-        return SlotAllocation(request.flight_id,runway,t,request.target,self._generation,request.priority)
+        return SlotAllocation(request.flight_id,runway,t,request.target,self._generation,request.priority,request.wake_class)
 
-    def commit(self,allocation:SlotAllocation,wake_class:str='M')->None:
+    def commit(self,allocation:SlotAllocation,wake_class:str|None=None)->None:
+        wake=wake_class or allocation.wake_class
+        stored=replace(allocation,wake_class=wake)
         existing=self._allocations.get(allocation.flight_id)
-        if existing and existing!=allocation:raise RuntimeError("flight already allocated")
-        if allocation.generation!=self._generation and not self._safe(allocation.runway,allocation.time,wake_class,allocation.flight_id):
+        if existing and existing!=stored:raise RuntimeError("flight already allocated")
+        if allocation.generation!=self._generation and not self._safe(allocation.runway,allocation.time,wake,allocation.flight_id):
             raise RuntimeError("slot allocation stale")
-        if not self._safe(allocation.runway,allocation.time,wake_class,allocation.flight_id):raise RuntimeError("slot conflict")
-        self._allocations[allocation.flight_id]=allocation;self._generation+=1
+        if not self._safe(allocation.runway,allocation.time,wake,allocation.flight_id):raise RuntimeError("slot conflict")
+        self._allocations[allocation.flight_id]=stored;self._generation+=1
 
     def swap(self,first:str,second:str)->tuple[SlotAllocation,SlotAllocation]:
         a=self._allocations[first];b=self._allocations[second]
@@ -96,7 +99,7 @@ class SlotCoordinator:
         nb=replace(b,runway=a.runway,time=a.time,generation=self._generation)
         temp=dict(self._allocations);del self._allocations[first];del self._allocations[second]
         try:
-            if not self._safe(na.runway,na.time,'M') or not self._safe(nb.runway,nb.time,'M'):raise RuntimeError("swap violates separation")
+            if not self._safe(na.runway,na.time,na.wake_class) or not self._safe(nb.runway,nb.time,nb.wake_class):raise RuntimeError("swap violates separation")
             self._allocations[first]=na;self._allocations[second]=nb;self._generation+=1
             return na,nb
         except Exception:

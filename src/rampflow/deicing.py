@@ -50,18 +50,23 @@ class Pad:
 class DeicingManager:
     def __init__(self,pads:Iterable[Pad],bands:Iterable[HoldoverBand]):
         self.pads={p.pad_id:p for p in pads}
+        for p in self.pads.values():
+            if p.bays<1:
+                raise ValueError("pad must have at least one bay")
         self.bands=tuple(bands)
         self.treatments:dict[str,Treatment]={}
         self._pad_use:dict[str,list[Window]]={p:[] for p in self.pads}
         self._sequence=0
 
-    def _holdover(self,precip:str,fluid_type:str,temp_c:float,concentration:int)->tuple[int,int]:
+    def holdover(self,precip:str,fluid_type:str,temp_c:float,concentration:int)->tuple[int,int]:
         candidates=[b for b in self.bands if b.applies(precip,fluid_type,temp_c,concentration)]
         if not candidates:
             raise ValueError("no holdover guidance")
         candidates.sort(key=lambda b:(b.concentration,b.min_temp_c),reverse=True)
         chosen=candidates[0]
         return chosen.min_minutes,chosen.max_minutes
+
+    _holdover=holdover
 
     def _inspection_interval(self,holdover_min:int,precip:str)->int:
         factor={"freezing-rain":Decimal("0.25"),"heavy-snow":Decimal("0.33"),"snow":Decimal("0.50"),"frost":Decimal("0.75")}.get(precip,Decimal("0.50"))
@@ -76,14 +81,18 @@ class DeicingManager:
         return max(5,int(base+setup+0.999))
 
     def find_slot(self, pad_id: str, earliest: datetime, duration_min: int) -> Window:
+        pad = self.pads[pad_id]
         start = utc(earliest)
         duration = timedelta(minutes=duration_min)
         for _ in range(300):
             candidate = Window(start, start + duration)
-            overlaps = [u for u in self._pad_use[pad_id] if u.overlaps(candidate)]
-            if not overlaps:
+            ends = sorted(u.end for u in self._pad_use[pad_id] if u.overlaps(candidate))
+            if len(ends) < pad.bays:
                 return candidate
-            start = max(u.end for u in overlaps)
+            # Every bay is busy for part of the candidate window.  No start
+            # before the (len-bays+1)-th earliest end can free a bay, so jump
+            # straight to it.
+            start = ends[len(ends) - pad.bays]
         raise RuntimeError("no deicing slot")
 
     def schedule(self,flight_id:str,pad_id:str,earliest:datetime,wingspan_m:float,fluid_type:str,concentration:int,precip:str,temp_c:float,fluid_liters:float)->Treatment:
@@ -124,5 +133,9 @@ class DeicingManager:
         t=self.treatments.pop(flight_id,None)
         if t is None:return False
         window=Window(t.start,t.end)
-        self._pad_use[t.pad_id]=[x for x in self._pad_use[t.pad_id] if x!=window]
+        uses=self._pad_use[t.pad_id]
+        for i,x in enumerate(uses):
+            if x==window:
+                del uses[i]
+                break
         return True

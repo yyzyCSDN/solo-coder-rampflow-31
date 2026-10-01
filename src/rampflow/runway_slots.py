@@ -66,13 +66,12 @@ class RunwaySlotManager:
         return datetime.fromtimestamp(rounded,tz=t.tzinfo)
 
     def _sep(self, leader: str, follower: str) -> int:
-        pair = tuple(sorted((leader, follower)))
-        direct = self.wake.get(pair)
+        # Wake separation is asymmetric: the following aircraft's category
+        # determines the hazard, so the (leader, follower) order is significant
+        # and must never be normalised or reversed.
+        direct = self.wake.get((leader, follower))
         if direct is not None:
             return int(direct)
-        reverse = self.wake.get((follower, leader))
-        if reverse is not None:
-            return int(reverse)
         return int(self.wake.get(("*", follower), 60))
 
     def _ctot_ok(self,req:SlotRequest,slot:datetime)->bool:
@@ -138,6 +137,16 @@ class RunwaySlotManager:
         self._uses[use.runway_id].append(committed)
         self._uses[use.runway_id].sort(key=lambda x:(x.slot,x.sequence))
         return Decision(True,"ok","runway slot committed",{"sequence":self._sequence})
+
+    def release(self,flight_id:str)->bool:
+        """Drop a committed use, e.g. when its departure plan expired or was cancelled."""
+        for runway_id in self._uses:
+            uses=self._uses[runway_id]
+            kept=[u for u in uses if u.flight_id!=flight_id]
+            if len(kept)!=len(uses):
+                self._uses[runway_id]=kept
+                return True
+        return False
 
     def resequence(self,runway_id:str,flight_order:Iterable[str],anchor:datetime)->tuple[RunwayUse,...]:
         order=list(flight_order)
